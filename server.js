@@ -4,6 +4,8 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
+const sharp = require('sharp');
+const archiver = require('archiver');
 const session = require('express-session');
 const RedisStore = require('connect-redis').default;
 const redis = require('redis');
@@ -611,7 +613,15 @@ app.post('/api/tokens/:tokenId/regenerate-qr', requireAuth, async (req, res) => 
 app.get('/api/tokens/:tokenId/qr', async (req, res) => {
   try {
     const { tokenId } = req.params;
-    const { format = 'png', download = false } = req.query;
+    const { format = 'png', download = false, quality = 90 } = req.query;
+    
+    // Validate format
+    const supportedFormats = ['png', 'jpg', 'jpeg', 'svg'];
+    if (!supportedFormats.includes(format.toLowerCase())) {
+      return res.status(400).json({ 
+        error: 'Unsupported format. Supported formats: png, jpg, jpeg, svg' 
+      });
+    }
     
     const tokenData = await db.getTokenById(tokenId);
     
@@ -628,15 +638,38 @@ app.get('/api/tokens/:tokenId/qr', async (req, res) => {
     
     const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
     const url = `${baseUrl}/upload/${tokenData.token}`;
+    const sanitizedName = tokenData.event_name.replace(/\\s+/g, '-').toLowerCase().replace(/[^a-z0-9-]/g, '');
     
     if (format === 'svg') {
       const qrSvg = await QRCode.toString(url, { type: 'svg' });
       res.setHeader('Content-Type', 'image/svg+xml');
       if (download) {
-        res.setHeader('Content-Disposition', `attachment; filename="qr-${tokenData.event_name.replace(/\\s+/g, '-').toLowerCase()}.svg"`);
+        res.setHeader('Content-Disposition', `attachment; filename="qr-${sanitizedName}.svg"`);
       }
       res.send(qrSvg);
+    } else if (format === 'jpg' || format === 'jpeg') {
+      // Generate PNG first, then convert to JPEG
+      const qrPng = await QRCode.toBuffer(url, {
+        type: 'png',
+        width: parseInt(req.query.width) || 256,
+        margin: parseInt(req.query.margin) || 1
+      });
+      
+      // Convert PNG to JPEG using Sharp
+      const qrJpeg = await sharp(qrPng)
+        .jpeg({ 
+          quality: Math.max(1, Math.min(100, parseInt(quality))), 
+          mozjpeg: true 
+        })
+        .toBuffer();
+      
+      res.setHeader('Content-Type', 'image/jpeg');
+      if (download) {
+        res.setHeader('Content-Disposition', `attachment; filename="qr-${sanitizedName}.jpg"`);
+      }
+      res.send(qrJpeg);
     } else {
+      // Default PNG format
       const qrPng = await QRCode.toBuffer(url, {
         type: 'png',
         width: parseInt(req.query.width) || 256,
@@ -644,13 +677,91 @@ app.get('/api/tokens/:tokenId/qr', async (req, res) => {
       });
       res.setHeader('Content-Type', 'image/png');
       if (download) {
-        res.setHeader('Content-Disposition', `attachment; filename="qr-${tokenData.event_name.replace(/\\s+/g, '-').toLowerCase()}.png"`);
+        res.setHeader('Content-Disposition', `attachment; filename="qr-${sanitizedName}.png"`);
       }
       res.send(qrPng);
     }
   } catch (error) {
     console.error('Get QR code error:', error);
     res.status(500).json({ error: 'Failed to generate QR code' });
+  }
+});
+
+// Bulk QR Code Download
+app.get('/api/tokens/qr/download-all', requireAuth, async (req, res) => {
+  try {
+    const { format = 'png', quality = 90 } = req.query;
+    const supportedFormats = ['png', 'jpg', 'jpeg'];
+    
+    if (!supportedFormats.includes(format.toLowerCase())) {
+      return res.status(400).json({ 
+        error: 'Unsupported format for bulk download. Supported: png, jpg, jpeg' 
+      });
+    }
+    
+    const userTokens = await db.getUserTokens(req.session.userId);
+    const activeTokens = userTokens.filter(token => 
+      !token.expires_at || new Date() < new Date(token.expires_at)
+    );
+    
+    if (activeTokens.length === 0) {
+      return res.status(404).json({ error: 'No active tokens found' });
+    }
+    
+    // Create ZIP archive
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const timestamp = new Date().toISOString().slice(0, 10);
+    
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="qr-codes-${timestamp}.zip"`);
+    
+    archive.pipe(res);
+    
+    for (const token of activeTokens) {
+      try {
+        const baseUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+        const url = `${baseUrl}/upload/${token.token}`;
+        const sanitizedName = token.event_name.replace(/\\s+/g, '-').toLowerCase().replace(/[^a-z0-9-]/g, '');
+        
+        if (format === 'jpg' || format === 'jpeg') {
+          // Generate JPEG
+          const qrPng = await QRCode.toBuffer(url, {
+            type: 'png',
+            width: 256,
+            margin: 1
+          });
+          
+          const qrJpeg = await sharp(qrPng)
+            .jpeg({ 
+              quality: Math.max(1, Math.min(100, parseInt(quality))), 
+              mozjpeg: true 
+            })
+            .toBuffer();
+          
+          archive.append(qrJpeg, { name: `${sanitizedName}.jpg` });
+        } else {
+          // Generate PNG
+          const qrPng = await QRCode.toBuffer(url, {
+            type: 'png',
+            width: 256,
+            margin: 1
+          });
+          
+          archive.append(qrPng, { name: `${sanitizedName}.png` });
+        }
+        
+        // Update access count for each token
+        await db.incrementTokenAccess(token.id);
+      } catch (tokenError) {
+        console.error(`Error processing token ${token.id}:`, tokenError);
+        // Continue with other tokens
+      }
+    }
+    
+    archive.finalize();
+  } catch (error) {
+    console.error('Bulk QR download error:', error);
+    res.status(500).json({ error: 'Failed to generate QR codes archive' });
   }
 });
 

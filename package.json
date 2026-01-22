@@ -7,7 +7,15 @@
     "start": "node server.js",
     "worker": "node worker.js",
     "dev": "node server.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "docker:build": "docker build -t guestphotoupload-backend .",
+    "docker:run": "docker run -p 3000:3000 --env-file .env guestphotoupload-backend",
+    "docker:dev": "docker-compose up -d",
+    "docker:dev:logs": "docker-compose logs -f",
+    "docker:dev:down": "docker-compose down",
+    "docker:prod": "docker-compose -f docker-compose.prod.yml up -d",
+    "docker:prod:logs": "docker-compose -f docker-compose.prod.yml logs -f",
+    "docker:prod:down": "docker-compose -f docker-compose.prod.yml down"
   },
   "keywords": [],
   "author": "",
@@ -16,6 +24,7 @@
     "@google-cloud/firestore": "^8.2.0",
     "@google-cloud/logging": "^11.2.1",
     "@google-cloud/storage": "^7.18.0",
+    "archiver": "^7.0.1",
     "bcryptjs": "^2.4.3",
     "connect-flash": "^0.1.1",
     "connect-redis": "^9.0.0",
@@ -31,6 +40,7 @@
     "passport-google-oauth20": "^2.0.0",
     "qrcode": "^1.5.4",
     "redis": "^5.10.0",
+    "sharp": "^0.34.5",
     "sqlite3": "^5.1.7",
     "stripe": "^20.2.0",
     "uuid": "^8.3.2"

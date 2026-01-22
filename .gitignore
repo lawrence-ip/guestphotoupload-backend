@@ -3,6 +3,11 @@ node_modules/
 
 # Environment variables
 .env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.prod
 
 # Temporary uploads
 uploads/
@@ -13,6 +18,18 @@ tokens.json
 # Google credentials
 credentials.json
 token.json
+credentials/
+*.json
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# SSL certificates
+ssl/
+*.pem
+*.key
+*.crt
 
 # Logs
 *.log

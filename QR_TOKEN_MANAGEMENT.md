@@ -32,9 +32,15 @@ const qrOptions = {
 ```
 
 ### Multiple Formats
-- **PNG**: Binary image format for downloads
+- **PNG**: Binary image format for downloads (default)
+- **JPG/JPEG**: Compressed format with quality control
 - **SVG**: Vector format for scalable graphics
 - **Data URLs**: Base64 encoded for direct embedding
+
+### Quality Control (JPEG only)
+- Quality parameter: 1-100 (default: 90)
+- Automatic optimization with mozjpeg
+- File size optimization for web and print
 
 ## 📊 Analytics & Tracking
 
@@ -107,8 +113,20 @@ GET /api/tokens/123/qr?format=png&width=512&download=true
 ```
 
 ```http
+GET /api/tokens/123/qr?format=jpg&quality=85&download=false
+```
+
+```http
 GET /api/tokens/123/qr?format=svg&download=false
 ```
+
+#### Bulk QR Code Download
+```http
+GET /api/tokens/qr/download-all?format=jpg&quality=90
+Authorization: Bearer [session]
+```
+
+Downloads all active tokens as a ZIP file with QR codes in the specified format.
 
 #### Refresh Token Expiration
 ```http
@@ -219,11 +237,42 @@ async function regenerateQR(tokenId, newOptions) {
 }
 
 // Download QR code in different formats
-function downloadQR(tokenId, format = 'png') {
+function downloadQR(tokenId, format = 'png', quality = 90) {
   const link = document.createElement('a');
-  link.href = `/api/tokens/${tokenId}/qr?format=${format}&download=true`;
+  let url = `/api/tokens/${tokenId}/qr?format=${format}&download=true`;
+  
+  if (format === 'jpg' || format === 'jpeg') {
+    url += `&quality=${quality}`;
+  }
+  
+  link.href = url;
   link.download = `qr-code.${format}`;
   link.click();
+}
+
+// Bulk download all QR codes
+function downloadAllQRCodes(format = 'png', quality = 90) {
+  const link = document.createElement('a');
+  link.href = `/api/tokens/qr/download-all?format=${format}&quality=${quality}`;
+  link.download = `qr-codes-${new Date().toISOString().slice(0, 10)}.zip`;
+  link.click();
+}
+
+// Preview QR code in different formats
+async function previewQRCode(tokenId, format = 'png', quality = 90) {
+  let url = `/api/tokens/${tokenId}/qr?format=${format}`;
+  
+  if (format === 'jpg' || format === 'jpeg') {
+    url += `&quality=${quality}`;
+  }
+  
+  if (format === 'svg') {
+    const response = await fetch(url);
+    const svgContent = await response.text();
+    document.getElementById('qr-preview').innerHTML = svgContent;
+  } else {
+    document.getElementById('qr-preview').innerHTML = `<img src="${url}" alt="QR Code">`;
+  }
 }
 ```
 

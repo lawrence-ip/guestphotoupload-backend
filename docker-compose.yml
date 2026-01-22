@@ -1,0 +1,77 @@
+version: '3.7'
+
+services:
+  app:
+    build: .
+    container_name: guestphotoupload-backend
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - PORT=3000
+      - DB_TYPE=${DB_TYPE:-sqlite}
+      - SESSION_SECRET=${SESSION_SECRET:-your-session-secret-change-this}
+      - SESSION_TIMEOUT=${SESSION_TIMEOUT:-604800000}
+      - TOKEN_SECRET=${TOKEN_SECRET:-your-token-secret}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3001}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - GOOGLE_CLOUD_PROJECT_ID=${GOOGLE_CLOUD_PROJECT_ID}
+      - GCP_BUCKET_NAME=${GCP_BUCKET_NAME}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}
+      - STRIPE_PUBLISHABLE_KEY=${STRIPE_PUBLISHABLE_KEY}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET}
+      - GOOGLE_OAUTH_REDIRECT_URI=${GOOGLE_OAUTH_REDIRECT_URI:-http://localhost:3000/api/oauth/google/callback}
+    volumes:
+      - uploads-data:/app/uploads
+      - app-data:/app/data
+    depends_on:
+      - redis
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: guestphotoupload-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # Optional: Database service if using PostgreSQL instead of SQLite
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: guestphotoupload-postgres
+  #   environment:
+  #     POSTGRES_DB: ${POSTGRES_DB:-guestphotoupload}
+  #     POSTGRES_USER: ${POSTGRES_USER:-guestuser}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-guestpass123}
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   networks:
+  #     - app-network
+  #   restart: unless-stopped
+
+volumes:
+  uploads-data:
+    driver: local
+  app-data:
+    driver: local
+  redis-data:
+    driver: local
+  # postgres-data:
+  #   driver: local
+
+networks:
+  app-network:
+    driver: bridge
