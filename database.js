@@ -403,6 +403,193 @@ class Database {
     });
   }
 
+  // Enhanced token management methods
+  async getTokenById(tokenId) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT t.*, u.email, u.drive_folder_name, u.bucket_name 
+         FROM upload_tokens t 
+         JOIN users u ON t.user_id = u.id 
+         WHERE t.id = ?`,
+        [tokenId],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row);
+        }
+      );
+    });
+  }
+
+  async updateTokenExpiration(tokenId, expiresAt) {
+    return new Promise((resolve, reject) => {
+      this.db.run(
+        'UPDATE upload_tokens SET expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [expiresAt, tokenId],
+        function(err) {
+          if (err) reject(err);
+          else resolve(this.changes);
+        }
+      );
+    });
+  }
+
+  async updateTokenMetadata(tokenId, metadata) {
+    return new Promise((resolve, reject) => {
+      // First, ensure the metadata columns exist
+      this.db.run('ALTER TABLE upload_tokens ADD COLUMN qr_generated_at TEXT', () => {
+        this.db.run('ALTER TABLE upload_tokens ADD COLUMN qr_options TEXT', () => {
+          this.db.run('ALTER TABLE upload_tokens ADD COLUMN access_count INTEGER DEFAULT 0', () => {
+            this.db.run('ALTER TABLE upload_tokens ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP', () => {
+              // Now update the metadata
+              const fields = [];
+              const values = [];
+              
+              if (metadata.qr_generated_at) {
+                fields.push('qr_generated_at = ?');
+                values.push(metadata.qr_generated_at);
+              }
+              if (metadata.qr_options) {
+                fields.push('qr_options = ?');
+                values.push(metadata.qr_options);
+              }
+              if (metadata.access_count !== undefined) {
+                fields.push('access_count = ?');
+                values.push(metadata.access_count);
+              }
+              
+              fields.push('updated_at = CURRENT_TIMESTAMP');
+              values.push(tokenId);
+              
+              if (fields.length > 1) {
+                this.db.run(
+                  `UPDATE upload_tokens SET ${fields.join(', ')} WHERE id = ?`,
+                  values,
+                  function(err) {
+                    if (err) reject(err);
+                    else resolve(this.changes);
+                  }
+                );
+              } else {
+                resolve(0);
+              }
+            });
+          });
+        });
+      });
+    });
+  }
+
+  async incrementTokenAccess(tokenId) {
+    return new Promise((resolve, reject) => {
+      this.db.run(
+        'UPDATE upload_tokens SET access_count = COALESCE(access_count, 0) + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [tokenId],
+        function(err) {
+          if (err) reject(err);
+          else resolve(this.changes);
+        }
+      );
+    });
+  }
+
+  async getTokenAnalytics(tokenId) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        'SELECT qr_generated_at, qr_options, access_count, created_at, updated_at FROM upload_tokens WHERE id = ?',
+        [tokenId],
+        (err, row) => {
+          if (err) reject(err);
+          else resolve(row || { access_count: 0 });
+        }
+      );
+    });
+  }
+
+  async getExpiredTokens() {
+    return new Promise((resolve, reject) => {
+      this.db.all(
+        'SELECT * FROM upload_tokens WHERE expires_at IS NOT NULL AND expires_at < datetime("now")',
+        [],
+        (err, rows) => {
+          if (err) reject(err);
+          else resolve(rows);
+        }
+      );
+    });
+  }
+
+  async cleanupExpiredTokens() {
+    return new Promise((resolve, reject) => {
+      this.db.serialize(() => {
+        // Delete uploads associated with expired tokens
+        this.db.run(
+          `DELETE FROM uploads WHERE token_id IN (
+            SELECT id FROM upload_tokens 
+            WHERE expires_at IS NOT NULL AND expires_at < datetime("now")
+          )`,
+          function(err) {
+            if (err) {
+              reject(err);
+              return;
+            }
+            const deletedUploads = this.changes;
+            
+            // Delete expired tokens
+            this.db.run(
+              'DELETE FROM upload_tokens WHERE expires_at IS NOT NULL AND expires_at < datetime("now")',
+              function(err) {
+                if (err) reject(err);
+                else resolve({
+                  deletedTokens: this.changes,
+                  deletedUploads
+                });
+              }
+            );
+          }
+        );
+      });
+    });
+  }
+
+  async getTokenStatistics(userId) {
+    return new Promise((resolve, reject) => {
+      this.db.get(
+        `SELECT 
+          COUNT(*) as total_tokens,
+          SUM(CASE WHEN expires_at IS NULL OR expires_at > datetime("now") THEN 1 ELSE 0 END) as active_tokens,
+          SUM(CASE WHEN expires_at IS NOT NULL AND expires_at <= datetime("now") THEN 1 ELSE 0 END) as expired_tokens,
+          COALESCE(SUM(access_count), 0) as total_access_count,
+          (SELECT COUNT(*) FROM uploads u 
+           JOIN upload_tokens ut ON u.token_id = ut.id 
+           WHERE ut.user_id = ?) as total_uploads
+        FROM upload_tokens WHERE user_id = ?`,
+        [userId, userId],
+        (err, row) => {
+          if (err) reject(err);
+          else {
+            // Get most active token
+            this.db.get(
+              `SELECT event_name, access_count, id 
+               FROM upload_tokens 
+               WHERE user_id = ? AND access_count = (
+                 SELECT MAX(access_count) FROM upload_tokens WHERE user_id = ?
+               ) 
+               LIMIT 1`,
+              [userId, userId],
+              (err2, mostActive) => {
+                if (err2) reject(err2);
+                else resolve({
+                  ...row,
+                  most_active_token: mostActive
+                });
+              }
+            );
+          }
+        }
+      );
+    });
+  }
+
   // Upload management
   async createUpload(tokenId, originalName, filename, size, mimetype) {
     return new Promise((resolve, reject) => {
