@@ -4,6 +4,9 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const session = require('express-session');
+const RedisStore = require('connect-redis').default;
+const redis = require('redis');
+const rateLimit = require('express-rate-limit');
 const flash = require('connect-flash');
 const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
@@ -70,17 +73,54 @@ app.post('/api/stripe/webhook', express.raw({type: 'application/json'}), async (
   }
 });
 
-// Session configuration
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'your-secret-key-change-this',
+// Redis client setup for session storage
+const redisClient = redis.createClient({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: process.env.REDIS_PORT || 6379,
+  password: process.env.REDIS_PASSWORD || undefined,
+  db: process.env.REDIS_DB || 0
+});
+
+redisClient.on('error', (err) => {
+  console.log('Redis Client Error', err);
+});
+
+redisClient.on('connect', () => {
+  console.log('Connected to Redis for session storage');
+});
+
+// Enhanced session configuration with Redis store
+const sessionConfig = {
+  store: new RedisStore({ client: redisClient }),
+  secret: process.env.SESSION_SECRET || 'your-secret-key-change-this-in-production',
   resave: false,
   saveUninitialized: false,
-  cookie: { 
-    secure: process.env.NODE_ENV === 'production', 
-    maxAge: 24 * 60 * 60 * 1000,
+  rolling: true, // Reset expiry on each request
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true, // Prevent XSS attacks
+    maxAge: parseInt(process.env.SESSION_TIMEOUT) || 7 * 24 * 60 * 60 * 1000, // 7 days default
     sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-  }
-}));
+  },
+  name: 'guestphoto.session' // Custom session name
+};
+
+// Fallback to memory store if Redis is not available
+redisClient.connect().catch(() => {
+  console.log('Redis not available, using memory store for sessions');
+  delete sessionConfig.store;
+});
+
+app.use(session(sessionConfig));
+
+// Rate limiting for auth endpoints
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 requests per windowMs
+  message: { error: 'Too many authentication attempts, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
 
 app.use(flash());
 
@@ -103,7 +143,11 @@ if (!fs.existsSync(tokensFile)) {
   fs.writeFileSync(tokensFile, JSON.stringify({}));
 }
 
-// Authentication middleware
+// Session cache for quick user lookup
+const userCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Enhanced authentication middleware
 function requireAuth(req, res, next) {
   if (req.session.userId) {
     next();
@@ -112,15 +156,75 @@ function requireAuth(req, res, next) {
   }
 }
 
+// Auto-login middleware to check for valid session
+async function autoLogin(req, res, next) {
+  if (req.session.userId && !req.user) {
+    try {
+      // Check cache first
+      const cacheKey = `user:${req.session.userId}`;
+      const cachedUser = userCache.get(cacheKey);
+      
+      if (cachedUser && cachedUser.timestamp > Date.now() - CACHE_TTL) {
+        req.user = cachedUser.data;
+        req.session.lastAccess = new Date();
+        await new Promise((resolve, reject) => {
+          req.session.save((err) => err ? reject(err) : resolve());
+        });
+        return next();
+      }
+      
+      // Fetch from database if not in cache
+      const user = await db.getUserById(req.session.userId);
+      if (user) {
+        req.user = {
+          id: user.id,
+          email: user.email,
+          name: user.name || user.email.split('@')[0],
+          subscription_status: user.subscription_status || 'trial',
+          subscription_end_date: user.subscription_end_date,
+          oauth_provider: user.provider || 'local',
+          profile_picture: user.avatar_url
+        };
+        
+        // Cache the user data
+        userCache.set(cacheKey, {
+          data: req.user,
+          timestamp: Date.now()
+        });
+        
+        req.session.lastAccess = new Date();
+        await new Promise((resolve, reject) => {
+          req.session.save((err) => err ? reject(err) : resolve());
+        });
+      } else {
+        // Invalid session, destroy it
+        req.session.destroy();
+        userCache.delete(cacheKey);
+      }
+    } catch (error) {
+      console.error('Auto-login error:', error);
+    }
+  }
+  next();
+}
+
+// Clear user from cache when needed
+function clearUserCache(userId) {
+  userCache.delete(`user:${userId}`);
+}
+
+// Apply auto-login middleware to all routes
+app.use(autoLogin);
+
 // Health check endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 // Authentication endpoints
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, rememberMe } = req.body;
     
     if (!email || !password) {
       return res.status(400).json({ error: 'Email and password are required' });
@@ -132,15 +236,38 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
 
+    // Set session
     req.session.userId = user.id;
+    req.session.lastAccess = new Date();
+    req.session.loginTime = new Date();
+    
+    // Extend session for "Remember Me"
+    if (rememberMe) {
+      req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000; // 30 days
+    }
+    
+    const userData = {
+      id: user.id,
+      email: user.email,
+      name: user.name || user.email.split('@')[0],
+      subscription_status: user.subscription_status || 'trial',
+      subscription_end_date: user.subscription_end_date,
+      oauth_provider: user.provider || 'local',
+      profile_picture: user.avatar_url
+    };
+    
+    // Cache user data
+    userCache.set(`user:${user.id}`, {
+      data: userData,
+      timestamp: Date.now()
+    });
+    
+    req.user = userData;
+    
     res.json({ 
       success: true, 
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name || user.email.split('@')[0],
-        subscription_status: user.subscription_status || 'trial'
-      }
+      user: userData,
+      sessionId: req.sessionID
     });
   } catch (error) {
     console.error('Login error:', error);
@@ -148,7 +275,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.post('/api/register', async (req, res) => {
+app.post('/api/register', authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body;
     
@@ -164,15 +291,33 @@ app.post('/api/register', async (req, res) => {
     const userId = await db.createUser(email, password);
     const user = await db.getUserById(userId);
     
+    // Set session
     req.session.userId = userId;
+    req.session.lastAccess = new Date();
+    req.session.loginTime = new Date();
+    
+    const userData = {
+      id: user.id,
+      email: user.email,
+      name: name,
+      subscription_status: user.subscription_status || 'trial',
+      subscription_end_date: user.subscription_end_date,
+      oauth_provider: user.provider || 'local',
+      profile_picture: user.avatar_url
+    };
+    
+    // Cache user data
+    userCache.set(`user:${userId}`, {
+      data: userData,
+      timestamp: Date.now()
+    });
+    
+    req.user = userData;
+    
     res.json({ 
       success: true, 
-      user: {
-        id: user.id,
-        email: user.email,
-        name: name,
-        subscription_status: user.subscription_status || 'trial'
-      }
+      user: userData,
+      sessionId: req.sessionID
     });
   } catch (error) {
     console.error('Registration error:', error);
@@ -180,18 +325,34 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-app.get('/api/logout', (req, res) => {
+app.post('/api/logout', (req, res) => {
+  const userId = req.session.userId;
+  
   req.session.destroy((err) => {
     if (err) {
       console.error('Logout error:', err);
       return res.status(500).json({ error: 'Failed to logout' });
     }
+    
+    // Clear user from cache
+    if (userId) {
+      clearUserCache(userId);
+    }
+    
+    // Clear cookie
+    res.clearCookie('guestphoto.session');
     res.json({ success: true });
   });
 });
 
 app.get('/api/user', requireAuth, async (req, res) => {
   try {
+    // Return cached user data from auto-login middleware
+    if (req.user) {
+      return res.json(req.user);
+    }
+    
+    // Fallback to database query
     const user = await db.getUserById(req.session.userId);
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -209,6 +370,70 @@ app.get('/api/user', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Get user error:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Session management endpoints
+app.get('/api/auth/check', (req, res) => {
+  if (req.session.userId && req.user) {
+    res.json({
+      authenticated: true,
+      user: req.user,
+      sessionInfo: {
+        sessionId: req.sessionID,
+        loginTime: req.session.loginTime,
+        lastAccess: req.session.lastAccess,
+        expiresIn: req.session.cookie.maxAge
+      }
+    });
+  } else {
+    res.json({ 
+      authenticated: false 
+    });
+  }
+});
+
+app.post('/api/auth/refresh', requireAuth, async (req, res) => {
+  try {
+    // Refresh session expiry
+    req.session.lastAccess = new Date();
+    
+    // Update cache
+    const cacheKey = `user:${req.session.userId}`;
+    const cachedUser = userCache.get(cacheKey);
+    if (cachedUser) {
+      userCache.set(cacheKey, {
+        data: cachedUser.data,
+        timestamp: Date.now()
+      });
+    }
+    
+    res.json({ 
+      success: true,
+      expiresIn: req.session.cookie.maxAge,
+      lastAccess: req.session.lastAccess
+    });
+  } catch (error) {
+    console.error('Session refresh error:', error);
+    res.status(500).json({ error: 'Failed to refresh session' });
+  }
+});
+
+app.get('/api/auth/sessions', requireAuth, async (req, res) => {
+  try {
+    // This would require storing session metadata in database
+    // For now, return current session info
+    res.json({
+      currentSession: {
+        sessionId: req.sessionID,
+        loginTime: req.session.loginTime,
+        lastAccess: req.session.lastAccess,
+        userAgent: req.headers['user-agent']
+      }
+    });
+  } catch (error) {
+    console.error('Get sessions error:', error);
+    res.status(500).json({ error: 'Failed to get sessions' });
   }
 });
 
@@ -574,5 +799,47 @@ async function startServer() {
     process.exit(1);
   }
 }
+
+// Session cleanup utilities
+function cleanupExpiredSessions() {
+  // Clear expired cache entries
+  for (const [key, value] of userCache.entries()) {
+    if (value.timestamp < Date.now() - CACHE_TTL) {
+      userCache.delete(key);
+    }
+  }
+}
+
+// Graceful shutdown handling
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully');
+  
+  // Close Redis connection
+  try {
+    await redisClient.quit();
+    console.log('Redis connection closed');
+  } catch (error) {
+    console.error('Error closing Redis connection:', error);
+  }
+  
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down gracefully');
+  
+  // Close Redis connection
+  try {
+    await redisClient.quit();
+    console.log('Redis connection closed');
+  } catch (error) {
+    console.error('Error closing Redis connection:', error);
+  }
+  
+  process.exit(0);
+});
+
+// Clean up expired sessions every 10 minutes
+setInterval(cleanupExpiredSessions, 10 * 60 * 1000);
 
 startServer();
